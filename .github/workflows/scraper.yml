@@ -1,0 +1,724 @@
+name: 🌍 Social Media Trend Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to scrape'
+        required: false
+        default: 'twitter,reddit'
+        type: choice
+        options:
+          - 'twitter'
+          - 'reddit'
+          - 'instagram'
+          - 'twitter,reddit'
+          - 'twitter,instagram'
+          - 'reddit,instagram'
+          - 'twitter,reddit,instagram'
+      region:
+        description: 'Trend region/country'
+        required: false
+        default: 'worldwide'
+        type: choice
+        options:
+          - 'worldwide'
+          - 'us'
+          - 'uk'
+          - 'iran'
+          - 'germany'
+          - 'france'
+          - 'japan'
+          - 'brazil'
+          - 'turkey'
+          - 'india'
+      trend_count:
+        description: 'Number of trends per platform'
+        required: false
+        default: '20'
+        type: string
+      include_sentiment:
+        description: 'Include sentiment analysis?'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      export_format:
+        description: 'Export format'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'json'
+          - 'csv'
+          - 'markdown'
+          - 'all'
+      commit_results:
+        description: 'Commit results to repo?'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+    - cron: '0 8 * * *'    # Daily at 8 AM
+
+jobs:
+  scrape-trends:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      
+      - name: 🚀 Start Cloudflare WARP
+        run: |
+          echo "🌐 Starting WARP VPN..."
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp \
+            --restart=no \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          
+          echo "⏳ Waiting for WARP to connect (30s)..."
+          sleep 30
+          
+          # Verify WARP is working
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 \
+              https://cloudflare.com/cdn-cgi/trace 2>/dev/null || echo "failed")
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "✅ WARP is active!"
+              WARP_IP=$(echo "$RESULT" | grep "ip=" | cut -d= -f2)
+              echo "📍 Exit IP: $WARP_IP"
+              break
+            else
+              echo "⏳ Attempt $i/10 - waiting..."
+              sleep 10
+            fi
+          done
+      
+      - name: 📦 Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pip jq curl
+          pip3 install --quiet \
+            snscrape \
+            praw \
+            instaloader \
+            pandas \
+            textblob \
+            matplotlib \
+            wordcloud
+      
+      - name: 🐦 Scrape Twitter/X Trends
+        if: contains(github.event.inputs.platforms || 'twitter,reddit', 'twitter')
+        run: |
+          python3 << 'EOF'
+          import snscrape.modules.twitter as sntwitter
+          import pandas as pd
+          import json
+          from datetime import datetime, timedelta
+          import os
+          
+          print("🐦 Starting Twitter trend scraping...")
+          
+          region = "${{ github.event.inputs.region || 'worldwide' }}"
+          trend_count = int("${{ github.event.inputs.trend_count || 20 }}")
+          
+          # Map regions to WOEIDs (Where On Earth ID)
+          woeids = {
+              'worldwide': 1,
+              'us': 23424977,
+              'uk': 23424975,
+              'iran': 23424851,
+              'germany': 23424829,
+              'france': 23424819,
+              'japan': 23424856,
+              'brazil': 23424768,
+              'turkey': 23424969,
+              'india': 23424848
+          }
+          
+          woeid = woeids.get(region, 1)
+          
+          # Scrape trending tweets (last 24 hours)
+          trends = []
+          since_time = (datetime.now() - timedelta(hours=24)).strftime("%Y-%m-%d")
+          
+          # Get trending topics (simulated via popular hashtags)
+          query = "min_faves:1000 lang:en"
+          
+          for i, tweet in enumerate(sntwitter.TwitterSearchScraper(
+              f'{query} since:{since_time}'
+          ).get_items()):
+              if i >= trend_count:
+                  break
+              trends.append({
+                  'platform': 'twitter',
+                  'date': tweet.date.isoformat(),
+                  'content': tweet.content[:200],
+                  'hashtags': tweet.hashtags,
+                  'likes': tweet.likeCount,
+                  'retweets': tweet.retweetCount,
+                  'replies': tweet.replyCount,
+                  'user': tweet.user.username,
+                  'followers': tweet.user.followersCount,
+                  'url': tweet.url,
+                  'region': region
+              })
+          
+          # Save results
+          os.makedirs('data/twitter', exist_ok=True)
+          
+          with open(f'data/twitter/trends_{region}_{datetime.now().strftime("%Y%m%d_%H%M")}.json', 'w') as f:
+              json.dump(trends, f, indent=2)
+          
+          # Also save as latest
+          with open('data/twitter/trends_latest.json', 'w') as f:
+              json.dump(trends, f, indent=2)
+          
+          # Generate summary
+          df = pd.DataFrame(trends)
+          if not df.empty:
+              top_hashtags = df['hashtags'].explode().value_counts().head(10)
+              print(f"\n📊 Top Twitter Hashtags ({region}):")
+              for tag, count in top_hashtags.items():
+                  print(f"  #{tag}: {count} mentions")
+              print(f"\n✅ Scraped {len(trends)} trending tweets")
+          else:
+              print("⚠️ No tweets found")
+          EOF
+          
+          # Save trend summary
+          python3 << 'EOF'
+          import json, os
+          from datetime import datetime
+          
+          trends_file = 'data/twitter/trends_latest.json'
+          if os.path.exists(trends_file):
+              with open(trends_file) as f:
+                  trends = json.load(f)
+              with open('data/twitter/summary.json', 'w') as f:
+                  json.dump({
+                      'platform': 'Twitter/X',
+                      'last_updated': datetime.now().isoformat(),
+                      'total_trends': len(trends),
+                      'sample': trends[:5] if trends else []
+                  }, f, indent=2)
+          EOF
+      
+      - name: 🤖 Scrape Reddit Trends
+        if: contains(github.event.inputs.platforms || 'twitter,reddit', 'reddit')
+        run: |
+          python3 << 'EOF'
+          import requests
+          import json
+          from datetime import datetime
+          import os
+          import time
+          
+          print("🤖 Starting Reddit trend scraping...")
+          
+          proxy = "socks5://127.0.0.1:1080"
+          proxies = {
+              'http': proxy,
+              'https': proxy
+          }
+          
+          region = "${{ github.event.inputs.region || 'worldwide' }}"
+          trend_count = int("${{ github.event.inputs.trend_count || 20 }}")
+          
+          # Map subreddits by region
+          regional_subs = {
+              'worldwide': ['all', 'popular', 'worldnews'],
+              'us': ['politics', 'news', 'funny', 'gaming'],
+              'uk': ['unitedkingdom', 'casualuk', 'britishproblems'],
+              'iran': ['iran', 'iranian', 'proiran'],
+              'germany': ['de', 'germany', 'ich_iel'],
+              'france': ['france', 'rance', 'paris'],
+              'japan': ['japan', 'newsokur', 'japanlife'],
+              'brazil': ['brasil', 'brasillivre', 'eu_nvr'],
+              'turkey': ['turkey', 'kurdistan', 'TurkeyJerky'],
+              'india': ['india', 'indiaspeaks', 'bakchodi']
+          }
+          
+          subreddits = regional_subs.get(region, ['all', 'popular'])
+          all_trends = []
+          
+          for subreddit in subreddits[:3]:
+              print(f"  📊 Scraping r/{subreddit}...")
+              
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+              }
+              
+              try:
+                  # Get hot posts
+                  response = requests.get(
+                      f'https://www.reddit.com/r/{subreddit}/hot.json?limit={trend_count}',
+                      headers=headers,
+                      proxies=proxies,
+                      timeout=30
+                  )
+                  
+                  if response.status_code == 200:
+                      data = response.json()
+                      for post in data['data']['children'][:trend_count]:
+                          post_data = post['data']
+                          all_trends.append({
+                              'platform': 'reddit',
+                              'subreddit': subreddit,
+                              'date': datetime.fromtimestamp(post_data['created_utc']).isoformat(),
+                              'title': post_data['title'],
+                              'score': post_data['score'],
+                              'comments': post_data['num_comments'],
+                              'upvote_ratio': post_data.get('upvote_ratio', 0),
+                              'author': post_data['author'],
+                              'url': f"https://reddit.com{post_data['permalink']}",
+                              'flair': post_data.get('link_flair_text', ''),
+                              'region': region
+                          })
+                      time.sleep(2)  # Rate limiting
+                  else:
+                      print(f"  ⚠️ HTTP {response.status_code} for r/{subreddit}")
+                      
+              except Exception as e:
+                  print(f"  ❌ Error scraping r/{subreddit}: {str(e)}")
+              
+          # Save results
+          os.makedirs('data/reddit', exist_ok=True)
+          
+          with open(f'data/reddit/trends_{region}_{datetime.now().strftime("%Y%m%d_%H%M")}.json', 'w') as f:
+              json.dump(all_trends, f, indent=2)
+          
+          with open('data/reddit/trends_latest.json', 'w') as f:
+              json.dump(all_trends, f, indent=2)
+          
+          # Summary
+          if all_trends:
+              print(f"\n📊 Top Reddit Posts ({region}):")
+              sorted_trends = sorted(all_trends, key=lambda x: x['score'], reverse=True)[:10]
+              for post in sorted_trends:
+                  print(f"  r/{post['subreddit']}: {post['title'][:80]} (⬆️ {post['score']})")
+              print(f"\n✅ Scraped {len(all_trends)} trending posts")
+          else:
+              print("⚠️ No Reddit posts found")
+          EOF
+      
+      - name: 📸 Scrape Instagram Trends
+        if: contains(github.event.inputs.platforms || 'twitter,reddit', 'instagram')
+        run: |
+          python3 << 'EOF'
+          import json
+          from datetime import datetime
+          import os
+          import requests
+          from textblob import TextBlob
+          
+          print("📸 Starting Instagram trend scraping...")
+          
+          proxy = "socks5://127.0.0.1:1080"
+          proxies = {
+              'http': proxy,
+              'https': proxy
+          }
+          
+          region = "${{ github.event.inputs.region || 'worldwide' }}"
+          trend_count = int("${{ github.event.inputs.trend_count || 20 }}")
+          
+          # Map region-specific hashtags
+          regional_tags = {
+              'worldwide': ['trending', 'viral', 'explorepage', 'instagood'],
+              'us': ['usa', 'americanstyle', 'nyc', 'california'],
+              'uk': ['ukstyle', 'londonlife', 'british'],
+              'iran': ['iran', 'tehran', 'persian', 'iranian'],
+              'germany': ['deutschland', 'berlin', 'germanstyle'],
+              'france': ['france', 'paris', 'frenchstyle'],
+              'japan': ['japan', 'tokyo', 'japanesestyle'],
+              'brazil': ['brasil', 'riodejaneiro', 'brazilianstyle'],
+              'turkey': ['turkey', 'istanbul', 'turkishstyle'],
+              'india': ['india', 'mumbai', 'indianstyle']
+          }
+          
+          tags = regional_tags.get(region, ['trending', 'viral'])
+          all_trends = []
+          
+          for tag in tags:
+              print(f"  🏷️ Scraping #{tag}...")
+              
+              # Using Instagram Basic Display API simulation
+              # Note: Instagram requires authentication for most endpoints
+              # This scrapes public data via the web interface
+              
+              headers = {
+                  'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15',
+                  'Accept': 'application/json'
+              }
+              
+              try:
+                  # Search hashtag via Instagram web API
+                  response = requests.get(
+                      f'https://www.instagram.com/explore/tags/{tag}/?__a=1',
+                      headers=headers,
+                      proxies=proxies,
+                      timeout=30
+                  )
+                  
+                  if response.status_code == 200:
+                      data = response.json()
+                      media_items = data.get('graphql', {}).get('hashtag', {}).get('edge_hashtag_to_media', {}).get('edges', [])
+                      
+                      for item in media_items[:trend_count]:
+                          node = item['node']
+                          caption = node.get('edge_media_to_caption', {}).get('edges', [{}])[0].get('node', {}).get('text', '')
+                          
+                          # Sentiment analysis
+                          sentiment = None
+                          if caption:
+                              blob = TextBlob(caption)
+                              sentiment = blob.sentiment.polarity
+                          
+                          all_trends.append({
+                              'platform': 'instagram',
+                              'hashtag': tag,
+                              'date': datetime.fromtimestamp(node['taken_at_timestamp']).isoformat(),
+                              'caption': caption[:200],
+                              'likes': node.get('edge_liked_by', {}).get('count', 0),
+                              'comments': node.get('edge_media_to_comment', {}).get('count', 0),
+                              'type': node.get('__typename', ''),
+                              'shortcode': node.get('shortcode', ''),
+                              'url': f"https://instagram.com/p/{node.get('shortcode', '')}",
+                              'sentiment': sentiment,
+                              'region': region
+                          })
+                      
+                      print(f"    Found {len(media_items[:trend_count])} posts")
+                  elif response.status_code == 429:
+                      print(f"    ⚠️ Rate limited, skipping #{tag}")
+                  else:
+                      print(f"    ⚠️ HTTP {response.status_code}")
+                      
+              except Exception as e:
+                  print(f"    ❌ Error: {str(e)[:100]}")
+          
+          # Save results
+          os.makedirs('data/instagram', exist_ok=True)
+          
+          timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+          with open(f'data/instagram/trends_{region}_{timestamp}.json', 'w') as f:
+              json.dump(all_trends, f, indent=2)
+          
+          with open('data/instagram/trends_latest.json', 'w') as f:
+              json.dump(all_trends, f, indent=2)
+          
+          if all_trends:
+              print(f"\n✅ Scraped {len(all_trends)} Instagram posts across {len(tags)} hashtags")
+          else:
+              print("⚠️ No Instagram posts found (may need authentication)")
+          EOF
+      
+      - name: 📊 Generate Trend Analysis
+        run: |
+          python3 << 'EOF'
+          import json
+          import pandas as pd
+          from datetime import datetime
+          from collections import Counter
+          import os
+          
+          print("📊 Generating trend analysis...")
+          
+          report = {
+              'generated_at': datetime.now().isoformat(),
+              'platforms': {}
+          }
+          
+          # Analyze Twitter
+          if os.path.exists('data/twitter/trends_latest.json'):
+              with open('data/twitter/trends_latest.json') as f:
+                  twitter_data = json.load(f)
+              
+              if twitter_data:
+                  df = pd.DataFrame(twitter_data)
+                  all_hashtags = []
+                  for tags in df['hashtags']:
+                      all_hashtags.extend(tags)
+                  
+                  hashtag_counts = Counter(all_hashtags)
+                  
+                  report['platforms']['twitter'] = {
+                      'total_posts': len(twitter_data),
+                      'top_hashtags': dict(hashtag_counts.most_common(10)),
+                      'total_engagement': int(df['likes'].sum() + df['retweets'].sum()),
+                      'avg_engagement_per_post': int((df['likes'].mean() + df['retweets'].mean()) / 2) if not df.empty else 0,
+                      'top_influencers': df.nlargest(5, 'followers')[['user', 'followers']].to_dict('records')
+                  }
+          
+          # Analyze Reddit
+          if os.path.exists('data/reddit/trends_latest.json'):
+              with open('data/reddit/trends_latest.json') as f:
+                  reddit_data = json.load(f)
+              
+              if reddit_data:
+                  df = pd.DataFrame(reddit_data)
+                  
+                  report['platforms']['reddit'] = {
+                      'total_posts': len(reddit_data),
+                      'total_score': int(df['score'].sum()),
+                      'total_comments': int(df['comments'].sum()),
+                      'avg_upvote_ratio': float(df['upvote_ratio'].mean()) if not df.empty else 0,
+                      'top_subreddits': df['subreddit'].value_counts().to_dict(),
+                      'viral_posts': df.nlargest(5, 'score')[['title', 'score', 'subreddit']].to_dict('records')
+                  }
+          
+          # Analyze Instagram
+          if os.path.exists('data/instagram/trends_latest.json'):
+              with open('data/instagram/trends_latest.json') as f:
+                  ig_data = json.load(f)
+              
+              if ig_data:
+                  report['platforms']['instagram'] = {
+                      'total_posts': len(ig_data),
+                      'total_engagement': sum(p.get('likes', 0) + p.get('comments', 0) for p in ig_data),
+                      'hashtags_analyzed': list(set(p['hashtag'] for p in ig_data)),
+                      'avg_sentiment': float(pd.DataFrame(ig_data)['sentiment'].mean()) if ig_data else 0
+                  }
+          
+          # Save report
+          os.makedirs('reports', exist_ok=True)
+          
+          timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+          with open(f'reports/trend_report_{timestamp}.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          
+          with open('reports/trend_report_latest.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          
+          # Generate Markdown report
+          md = f"""# 🌍 Social Media Trend Report
+          **Generated:** {report['generated_at']}
+          **Region:** ${{ github.event.inputs.region || 'worldwide' }}
+          
+          ---
+          """
+          
+          for platform, data in report['platforms'].items():
+              md += f"\n## {platform.upper()}\n"
+              md += f"- **Total Posts Analyzed:** {data.get('total_posts', 0)}\n"
+              
+              if platform == 'twitter':
+                  md += f"- **Total Engagement:** {data.get('total_engagement', 0):,}\n"
+                  md += f"\n### 📈 Top Hashtags\n"
+                  for tag, count in list(data.get('top_hashtags', {}).items())[:5]:
+                      md += f"- #{tag}: {count} mentions\n"
+                  
+                  md += f"\n### 👤 Top Influencers\n"
+                  for inf in data.get('top_influencers', []):
+                      md += f"- @{inf['user']}: {inf['followers']:,} followers\n"
+              
+              elif platform == 'reddit':
+                  md += f"- **Total Karma:** {data.get('total_score', 0):,}\n"
+                  md += f"- **Avg Upvote Ratio:** {data.get('avg_upvote_ratio', 0):.1%}\n"
+                  md += f"\n### 🔥 Viral Posts\n"
+                  for post in data.get('viral_posts', [])[:3]:
+                      md += f"- r/{post['subreddit']}: {post['title'][:80]}... (⬆️ {post['score']:,})\n"
+              
+              elif platform == 'instagram':
+                  md += f"- **Avg Sentiment:** {data.get('avg_sentiment', 0):.2f}\n"
+          
+          with open('reports/trend_report_latest.md', 'w') as f:
+              f.write(md)
+          
+          print("✅ Analysis complete!")
+          print(f"\n📄 Report saved to reports/trend_report_latest.md")
+          EOF
+      
+      - name: 📈 Generate Visualizations
+        if: github.event.inputs.include_sentiment != 'false'
+        run: |
+          python3 << 'EOF'
+          import matplotlib
+          matplotlib.use('Agg')
+          import matplotlib.pyplot as plt
+          import pandas as pd
+          import json
+          from wordcloud import WordCloud
+          import os
+          
+          os.makedirs('reports/charts', exist_ok=True)
+          
+          # Twitter hashtag wordcloud
+          if os.path.exists('data/twitter/trends_latest.json'):
+              with open('data/twitter/trends_latest.json') as f:
+                  data = json.load(f)
+              
+              if data:
+                  hashtags = ' '.join([' '.join(t['hashtags']) for t in data])
+                  if hashtags.strip():
+                      wordcloud = WordCloud(width=800, height=400, background_color='white').generate(hashtags)
+                      plt.figure(figsize=(10, 5))
+                      plt.imshow(wordcloud, interpolation='bilinear')
+                      plt.axis('off')
+                      plt.title('Twitter Trending Hashtags')
+                      plt.savefig('reports/charts/twitter_wordcloud.png', dpi=100, bbox_inches='tight')
+                      plt.close()
+          
+          # Platform comparison chart
+          platforms = []
+          if os.path.exists('data/twitter/trends_latest.json'):
+              with open('data/twitter/trends_latest.json') as f:
+                  platforms.append(('Twitter', len(json.load(f))))
+          if os.path.exists('data/reddit/trends_latest.json'):
+              with open('data/reddit/trends_latest.json') as f:
+                  platforms.append(('Reddit', len(json.load(f))))
+          if os.path.exists('data/instagram/trends_latest.json'):
+              with open('data/instagram/trends_latest.json') as f:
+                  platforms.append(('Instagram', len(json.load(f))))
+          
+          if platforms:
+              names, counts = zip(*platforms)
+              plt.figure(figsize=(8, 5))
+              plt.bar(names, counts, color=['#1DA1F2', '#FF4500', '#E4405F'])
+              plt.title('Trends Collected by Platform')
+              plt.ylabel('Number of Posts')
+              plt.savefig('reports/charts/platform_comparison.png', dpi=100, bbox_inches='tight')
+              plt.close()
+          
+          print("✅ Charts generated in reports/charts/")
+          EOF
+      
+      - name: 📦 Export Data
+        if: github.event.inputs.commit_results != 'false'
+        run: |
+          EXPORT_FORMAT="${{ github.event.inputs.export_format || 'all' }}"
+          
+          # Export JSON
+          if [[ "$EXPORT_FORMAT" == "all" ]] || [[ "$EXPORT_FORMAT" == "json" ]]; then
+            echo "📦 Exporting JSON..."
+            mkdir -p exports/json
+            
+            # Combine all platforms
+            python3 << 'EOF'
+          import json, os
+          from datetime import datetime
+          
+          combined = {
+              'export_date': datetime.now().isoformat(),
+              'twitter': None,
+              'reddit': None,
+              'instagram': None
+          }
+          
+          for platform in ['twitter', 'reddit', 'instagram']:
+              file_path = f'data/{platform}/trends_latest.json'
+              if os.path.exists(file_path):
+                  with open(file_path) as f:
+                      combined[platform] = json.load(f)
+          
+          os.makedirs('exports/json', exist_ok=True)
+          timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+          with open(f'exports/json/combined_trends_{timestamp}.json', 'w') as f:
+              json.dump(combined, f, indent=2)
+          
+          with open('exports/json/combined_trends_latest.json', 'w') as f:
+              json.dump(combined, f, indent=2)
+          
+          print("✅ JSON export complete")
+          EOF
+          fi
+          
+          # Export CSV
+          if [[ "$EXPORT_FORMAT" == "all" ]] || [[ "$EXPORT_FORMAT" == "csv" ]]; then
+            echo "📊 Exporting CSV..."
+            python3 << 'EOF'
+          import pandas as pd
+          import json
+          import os
+          from datetime import datetime
+          
+          os.makedirs('exports/csv', exist_ok=True)
+          timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+          
+          for platform in ['twitter', 'reddit', 'instagram']:
+              file_path = f'data/{platform}/trends_latest.json'
+              if os.path.exists(file_path):
+                  with open(file_path) as f:
+                      data = json.load(f)
+                  if data:
+                      df = pd.DataFrame(data)
+                      df.to_csv(f'exports/csv/{platform}_trends_{timestamp}.csv', index=False)
+                      df.to_csv(f'exports/csv/{platform}_trends_latest.csv', index=False)
+                      print(f"✅ {platform} CSV export: {len(df)} rows")
+          EOF
+          fi
+          
+          echo "✅ All exports complete!"
+      
+      - name: 💾 Commit Results
+        if: github.event.inputs.commit_results != 'false'
+        run: |
+          git config user.name "Trend Scraper Bot"
+          git config user.email "bot@social-trends.local"
+          
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          
+          # Stage all new data
+          git add data/ reports/ exports/ 2>/dev/null || true
+          
+          if git diff --staged --quiet; then
+            echo "ℹ️ No new changes to commit"
+          else
+            REGION="${{ github.event.inputs.region || 'worldwide' }}"
+            PLATFORMS="${{ github.event.inputs.platforms || 'twitter,reddit' }}"
+            
+            git commit -m "📊 Update trends: $PLATFORMS ($REGION) [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin HEAD:"${GITHUB_REF_NAME}"
+            
+            echo "✅ Results committed and pushed!"
+          fi
+      
+      - name: 🛑 Stop WARP
+        if: always()
+        run: |
+          docker stop warp 2>/dev/null || true
+          docker rm warp 2>/dev/null || true
+      
+      - name: 📋 Generate Summary
+        run: |
+          echo "## 🌍 Social Media Trend Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ github.event.inputs.region || 'worldwide' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Platforms:** ${{ github.event.inputs.platforms || 'twitter,reddit' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f reports/trend_report_latest.md ]; then
+            cat reports/trend_report_latest.md >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Charts" >> $GITHUB_STEP_SUMMARY
+          for chart in reports/charts/*.png; do
+            if [ -f "$chart" ]; then
+              echo "![Chart]($chart)" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**📄 Full report:** [trend_report_latest.md](reports/trend_report_latest.md)" >> $GITHUB_STEP_SUMMARY
