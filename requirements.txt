@@ -1,0 +1,8 @@
+snscrape==0.7.0.20230622
+praw==7.7.1
+instaloader==4.10.3
+pandas==2.0.3
+textblob==0.17.1
+matplotlib==3.7.2
+wordcloud==1.9.3
+requests==2.31.0
